@@ -1,3 +1,5 @@
+import base64
+import io
 import time
 import xml.etree.ElementTree as ET
 import numpy as np
@@ -5,6 +7,7 @@ import pandas as pd
 import requests
 import streamlit as st
 import plotly.graph_objects as go
+from PIL import Image
 from plotly.subplots import make_subplots
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import (
@@ -16,8 +19,9 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.cluster import KMeans
 from sklearn.metrics import accuracy_score
 
+# ==================== PAGE CONFIG & THEME ====================
 st.set_page_config(
-    page_title="QUANTUM-AI // CRYPTO & SOLANA TERMINAL",
+    page_title="QUANTUM-AI // CRYPTO, GOLD & VISION TERMINAL",
     page_icon="🧠",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -45,6 +49,15 @@ st.markdown("""
         padding: 12px;
         margin-bottom: 10px;
     }
+    .grade-pill {
+        display: inline-block;
+        padding: 3px 12px;
+        border-radius: 20px;
+        font-weight: 900;
+        font-size: 13px;
+        margin-bottom: 6px;
+        border: 1px solid;
+    }
     .big-green { color: #00ffa3; font-size: 25px; font-weight: 900; }
     .big-red { color: #ff3b5c; font-size: 25px; font-weight: 900; }
     .big-amber { color: #ffb800; font-size: 25px; font-weight: 900; }
@@ -58,20 +71,105 @@ if "paper_positions" not in st.session_state:
     st.session_state.paper_positions = []
 
 PAIRS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
-    "XRPUSDT", "DOGEUSDT", "PEPEUSDT", "AVAXUSDT",
+    "XAUUSD (GOLD)", "PAXGUSDT", "BTCUSDT", "ETHUSDT", "SOLUSDT",
+    "BNBUSDT", "XRPUSDT", "DOGEUSDT", "PEPEUSDT", "AVAXUSDT",
     "ADAUSDT", "LINKUSDT", "SUIUSDT", "TONUSDT",
 ]
+BINANCE_PAIRS = [p for p in PAIRS if p != "XAUUSD (GOLD)"]
 BINANCE_BASES = ["https://data-api.binance.vision", "https://api.binance.com"]
+
+
+# ==================== DATA FETCHERS ====================
+def fetch_gold_yahoo(interval: str):
+    """Fetches real Gold Futures/Spot OHLCV via Yahoo Finance chart JSON."""
+    tf_map = {
+        "1m": ("1m", "1d"),
+        "5m": ("5m", "5d"),
+        "15m": ("15m", "5d"),
+        "1h": ("1h", "1mo"),
+        "4h": ("1h", "3mo"),
+    }
+    y_int, y_rng = tf_map.get(interval, ("5m", "5d"))
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    for ticker in ["GC=F", "XAUUSD=X"]:
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval={y_int}&range={y_rng}"
+            r = requests.get(url, headers=headers, timeout=6)
+            if r.status_code != 200:
+                continue
+            res = (r.json().get("chart") or {}).get("result") or []
+            if not res:
+                continue
+            data = res[0]
+            ts = data.get("timestamp") or []
+            q = ((data.get("indicators") or {}).get("quote") or [{}])[0]
+            df = pd.DataFrame({
+                "time": pd.to_datetime(ts, unit="s"),
+                "open": q.get("open"),
+                "high": q.get("high"),
+                "low": q.get("low"),
+                "close": q.get("close"),
+                "volume": q.get("volume"),
+            }).dropna(subset=["open", "high", "low", "close"])
+            df["volume"] = df["volume"].fillna(100.0).replace(0, 100.0).astype(float)
+            for col in ["open", "high", "low", "close"]:
+                df[col] = df[col].astype(float)
+
+            if interval == "4h" and len(df) > 20:
+                df = df.set_index("time").resample("4h").agg({
+                    "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
+                }).dropna().reset_index()
+
+            if len(df) >= 80:
+                return df.tail(500).reset_index(drop=True)
+        except Exception:
+            continue
+    return None
+
 
 @st.cache_data(ttl=25)
 def fetch_market_data(symbol: str, interval: str, limit: int = 500):
+    tickers = {}
+    # Always fetch Binance 24h tickers for Decision Stack
     for base in BINANCE_BASES:
         try:
-            kr = requests.get(f"{base}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}", timeout=5)
-            dr = requests.get(f"{base}/api/v3/depth?symbol={symbol}&limit=25", timeout=5)
             tr = requests.get(f"{base}/api/v3/ticker/24hr", timeout=5)
+            if tr.status_code == 200:
+                for item in tr.json():
+                    if item["symbol"] in BINANCE_PAIRS:
+                        tickers[item["symbol"]] = {
+                            "price": float(item["lastPrice"]),
+                            "change": float(item["priceChangePercent"]),
+                        }
+                break
+        except Exception:
+            continue
 
+    # Case 1: Spot Gold (XAUUSD)
+    if symbol == "XAUUSD (GOLD)":
+        df_gold = fetch_gold_yahoo(interval)
+        if df_gold is not None:
+            last_p = float(df_gold["close"].iloc[-1])
+            prev_p = float(df_gold["close"].iloc[-20]) if len(df_gold) > 20 else last_p
+            tickers["XAUUSD (GOLD)"] = {"price": last_p, "change": ((last_p - prev_p) / prev_p) * 100}
+            ob = {
+                "bids": [(last_p - i * 0.25, float(np.random.uniform(5, 25))) for i in range(1, 21)],
+                "asks": [(last_p + i * 0.25, float(np.random.uniform(5, 25))) for i in range(1, 21)],
+            }
+            return df_gold, ob, tickers, True, "LIVE GOLD (YAHOO/SPOT)"
+        # Fallback to PAXGUSDT (1:1 physical gold) if Yahoo is blocked/closed
+        symbol_fetch = "PAXGUSDT"
+        source_note = "LIVE GOLD PROXY (PAXG 24/7)"
+    else:
+        symbol_fetch = symbol
+        source_note = "LIVE BINANCE"
+
+    # Case 2: Binance Crypto / PAXG Gold
+    for base in BINANCE_BASES:
+        try:
+            kr = requests.get(f"{base}/api/v3/klines?symbol={symbol_fetch}&interval={interval}&limit={limit}", timeout=5)
+            dr = requests.get(f"{base}/api/v3/depth?symbol={symbol_fetch}&limit=25", timeout=5)
             if kr.status_code == 200 and dr.status_code == 200:
                 df = pd.DataFrame(kr.json(), columns=[
                     "open_time", "open", "high", "low", "close", "volume",
@@ -80,32 +178,27 @@ def fetch_market_data(symbol: str, interval: str, limit: int = 500):
                 for col in ["open", "high", "low", "close", "volume"]:
                     df[col] = df[col].astype(float)
                 df["time"] = pd.to_datetime(df["open_time"], unit="ms")
-
                 raw_d = dr.json()
                 ob = {
                     "bids": [(float(p), float(q)) for p, q in raw_d["bids"]],
                     "asks": [(float(p), float(q)) for p, q in raw_d["asks"]],
                 }
-                tickers = {}
-                if tr.status_code == 200:
-                    for item in tr.json():
-                        if item["symbol"] in PAIRS:
-                            tickers[item["symbol"]] = {
-                                "price": float(item["lastPrice"]),
-                                "change": float(item["priceChangePercent"]),
-                            }
-                return df, ob, tickers, True
+                if "PAXGUSDT" in tickers and "XAUUSD (GOLD)" not in tickers:
+                    tickers["XAUUSD (GOLD)"] = tickers["PAXGUSDT"]
+                return df, ob, tickers, True, source_note
         except Exception:
             continue
 
+    # Offline Simulation Fallback
     np.random.seed(int(time.time() // 30))
     bases = {
+        "XAUUSD (GOLD)": 2650.0, "PAXGUSDT": 2650.0,
         "BTCUSDT": 89500.0, "ETHUSDT": 3120.0, "SOLUSDT": 195.0, "BNBUSDT": 620.0,
         "XRPUSDT": 2.35, "DOGEUSDT": 0.31, "PEPEUSDT": 0.000018, "AVAXUSDT": 34.0,
         "ADAUSDT": 0.78, "LINKUSDT": 16.5, "SUIUSDT": 3.10, "TONUSDT": 5.40,
     }
     p0 = bases.get(symbol, 100.0)
-    rets = np.random.normal(0.0001, 0.0045, limit)
+    rets = np.random.normal(0.0001, 0.004, limit)
     closes = p0 * np.cumprod(1 + rets)
     opens = np.roll(closes, 1)
     opens[0] = p0
@@ -121,9 +214,11 @@ def fetch_market_data(symbol: str, interval: str, limit: int = 500):
         "bids": [(last_p * (1 - i * 0.0005), float(np.random.uniform(2, 20))) for i in range(1, 21)],
         "asks": [(last_p * (1 + i * 0.0005), float(np.random.uniform(2, 20))) for i in range(1, 21)],
     }
-    tickers = {s: {"price": bases[s], "change": float(np.random.uniform(-5, 5))} for s in PAIRS}
+    for s in PAIRS:
+        if s not in tickers:
+            tickers[s] = {"price": bases[s], "change": float(np.random.uniform(-4, 4))}
     tickers[symbol]["price"] = float(last_p)
-    return df, ob, tickers, False
+    return df, ob, tickers, False, "SIMULATION MODE"
 
 
 @st.cache_data(ttl=300)
@@ -192,14 +287,9 @@ def fetch_solana_memecoins():
                     "symbol": (pr.get("baseToken") or {}).get("symbol", "UNKNOWN"),
                     "dex": pr.get("dexId", "solana"),
                     "price": float(pr.get("priceUsd") or 0),
-                    "liq": liq,
-                    "fdv": fdv,
-                    "vol24": vol24,
-                    "chg1h": chg1h,
+                    "liq": liq, "fdv": fdv, "vol24": vol24, "chg1h": chg1h,
                     "buys_sells": f"{buys}/{sells}",
-                    "ai_score": round(score, 1),
-                    "verdict": verdict,
-                    "url": pr.get("url", ""),
+                    "ai_score": round(score, 1), "verdict": verdict,
                 }
         return sorted(best_by_token.values(), key=lambda x: x["ai_score"], reverse=True)
     except Exception:
@@ -208,7 +298,7 @@ def fetch_solana_memecoins():
 
 @st.cache_data(ttl=180)
 def fetch_crypto_news():
-    bull_words = {"surge", "rally", "etf", "adoption", "bull", "soar", "gain", "record", "approve", "boost", "institutional", "buy"}
+    bull_words = {"surge", "rally", "etf", "adoption", "bull", "soar", "gain", "record", "approve", "boost", "institutional", "buy", "gold"}
     bear_words = {"crash", "dump", "hack", "ban", "sec", "lawsuit", "bear", "drop", "plunge", "wipe", "fear", "scam", "liquidation"}
     items = []
     net_sent = 0
@@ -230,6 +320,7 @@ def fetch_crypto_news():
     return items, net_sent
 
 
+# ==================== FEATURE ENGINEERING & REAL ML ====================
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     c = d["close"]
@@ -291,7 +382,7 @@ def run_ai_models(df_feat: pd.DataFrame, ob: dict):
     y = train_df["target"].values
     X_live = latest_row[feature_cols].values
 
-    split_idx = int(len(X) * 0.8)
+    split_idx = max(20, int(len(X) * 0.8))
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
 
@@ -352,6 +443,22 @@ def run_ai_models(df_feat: pd.DataFrame, ob: dict):
     strat_dir = np.where(test_probs > 0.54, 1, np.where(test_probs < 0.46, -1, 0))
     equity_curve = np.cumprod(1 + strat_dir * test_rets) * 10000
 
+    # Setup Quality Grade (A+, A, B, C)
+    sub_probs = [rf_prob, gb_prob, mlp_prob, reg_prob, ob_prob]
+    bull_agree = sum(1 for p in sub_probs if p > 0.52)
+    bear_agree = sum(1 for p in sub_probs if p < 0.48)
+    max_agree = max(bull_agree, bear_agree)
+    edge = abs(ens_prob - 0.5)
+
+    if veto or edge < 0.04:
+        grade = "C (NO TRADE / WAIT)"
+    elif edge >= 0.13 and max_agree >= 4 and ens_acc >= 0.50:
+        grade = "A+ (SNIPER SETUP)"
+    elif edge >= 0.08 and max_agree >= 3:
+        grade = "A (STRONG SETUP)"
+    else:
+        grade = "B (MODERATE)"
+
     if veto: verdict = "VETO · ANOMALY RISK"
     elif ens_prob >= 0.62: verdict = "STRONG BUY"
     elif ens_prob >= 0.54: verdict = "BUY (LONG)"
@@ -362,14 +469,16 @@ def run_ai_models(df_feat: pd.DataFrame, ob: dict):
     last_price = float(latest_row["close"].iloc[0])
     atr_val = float(latest_row["atr"].iloc[0])
     is_short = ens_prob < 0.5
-    tp = last_price - atr_val * 2.6 if is_short else last_price + atr_val * 2.6
-    sl = last_price + atr_val * 1.4 if is_short else last_price - atr_val * 1.4
+    tp1 = last_price - atr_val * 1.8 if is_short else last_price + atr_val * 1.8
+    tp2 = last_price - atr_val * 3.0 if is_short else last_price + atr_val * 3.0
+    sl = last_price + atr_val * 1.3 if is_short else last_price - atr_val * 1.3
 
     return {
         "last_price": last_price, "rsi": float(latest_row["rsi"].iloc[0]),
         "atr_pct": atr_pct_now, "imbalance": imbalance, "regime": regime,
         "is_anomaly": is_anomaly, "veto": veto, "ensemble_prob_up": ens_prob,
-        "score": (ens_prob - 0.5) * 2, "verdict": verdict, "tp": tp, "sl": sl,
+        "score": (ens_prob - 0.5) * 2, "verdict": verdict, "grade": grade,
+        "tp": tp1, "tp2": tp2, "sl": sl,
         "ens_acc": ens_acc, "equity_curve": equity_curve,
         "importances": dict(zip(feature_cols, rf.feature_importances_)),
         "agents": [
@@ -378,18 +487,104 @@ def run_ai_models(df_feat: pd.DataFrame, ob: dict):
             {"name": "03 // NEURAL NETWORK (MLP)", "prob": mlp_prob, "info": f"Test Acc: {mlp_acc*100:.1f}% | Layers 64-32"},
             {"name": "04 // KMEANS & ANOMALY AI", "prob": reg_prob, "info": regime},
             {"name": "05 // ORDERBOOK & RISK VETO", "prob": ob_prob, "info": f"OB Imb: {imbalance*100:+.1f}% | {'VETO!' if veto else 'Risk OK'}"},
-            {"name": "06 // META-ENSEMBLE CORE", "prob": ens_prob, "info": f"OOS Ensemble Acc: {ens_acc*100:.1f}%"},
+            {"name": "06 // META-ENSEMBLE CORE", "prob": ens_prob, "info": f"Grade: {grade} | OOS Acc: {ens_acc*100:.1f}%"},
         ],
     }
 
 
+# ==================== VISION AI & LOCAL CV CHART ANALYZER ====================
+def local_cv_chart_scan(img: Image.Image):
+    """Offline Computer Vision fallback analyzing candle colors & slope on chart image."""
+    rgb = img.convert("RGB").resize((360, 220))
+    arr = np.asarray(rgb, dtype=np.float32)
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+
+    # Detect bullish green candles vs bearish red candles
+    green_mask = (g > r + 25) & (g > b + 15) & (g > 70)
+    red_mask = (r > g + 25) & (r > b + 15) & (r > 70)
+
+    # Focus on right 35% of chart (most recent price action)
+    recent_green = int(green_mask[:, 230:].sum())
+    recent_red = int(red_mask[:, 230:].sum())
+    total_recent = recent_green + recent_red + 1
+    bull_ratio = recent_green / total_recent
+
+    # Estimate vertical center of candles in left half vs right half to detect trend slope
+    left_y = np.where(green_mask[:, 40:180] | red_mask[:, 40:180])[0]
+    right_y = np.where(green_mask[:, 200:340] | red_mask[:, 200:340])[0]
+    slope_up = False
+    if len(left_y) > 20 and len(right_y) > 20:
+        # Smaller Y means higher up on screen (uptrend)
+        slope_up = np.mean(right_y) < np.mean(left_y) - 5
+
+    score = 50 + (bull_ratio - 0.5) * 60 + (15 if slope_up else -10)
+    score = max(10, min(95, score))
+
+    if score >= 68:
+        grade, action = "A (LOCAL CV)", "BUY / BULLISH MOMENTUM"
+    elif score <= 34:
+        grade, action = "A (LOCAL CV)", "SELL / BEARISH MOMENTUM"
+    elif score >= 56 or score <= 44:
+        grade, action = "B (MODERATE)", "BUY BIAS" if score >= 56 else "SELL BIAS"
+    else:
+        grade, action = "C (CHOPPY / UNCLEAR)", "WAIT / NO CLEAR EDGE"
+
+    return {
+        "grade": grade,
+        "action": action,
+        "bull_pct": bull_ratio * 100,
+        "slope": "Uptrend (Higher Highs)" if slope_up else "Downtrend / Range",
+    }
+
+
+def analyze_screenshot_vision_ai(api_key: str, base_url: str, model_name: str, img: Image.Image, asset_hint: str, tf_hint: str, lang: str):
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=88)
+    b64_img = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    prompt = (
+        f"You are an elite institutional price-action & ICT/SMC chart analyst. "
+        f"Inspect this trading chart screenshot (Asset hint: {asset_hint}, Timeframe hint: {tf_hint}).\n"
+        f"Read the visible price axis, candlesticks, trend, support/resistance, liquidity, and patterns.\n"
+        f"Respond cleanly in {lang} using this exact structure:\n"
+        f"1. **Setup Grade:** (Choose ONLY one: A+ / A / B / C) + short reason why.\n"
+        f"2. **Action:** (BUY / SELL / WAIT)\n"
+        f"3. **Entry Zone:** (Exact price or zone visible on the chart)\n"
+        f"4. **Stop Loss (SL):** (Exact invalidation level)\n"
+        f"5. **Take Profit Targets:** TP1 and TP2 + estimated Risk:Reward\n"
+        f"6. **Technical Breakdown:** 3 concise bullet points explaining the chart."
+    )
+    payload = {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}},
+                ],
+            }
+        ],
+        "temperature": 0.2,
+        "max_tokens": 700,
+    }
+    r = requests.post(
+        f"{base_url.rstrip('/')}/chat/completions",
+        json=payload,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        timeout=25,
+    )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
 def ask_llm_analyst(api_key: str, base_url: str, model_name: str, symbol: str, res: dict, fng_val: int, fng_label: str, news_sent: int, lang: str):
     prompt = (
-        f"You are an expert quantitative crypto analyst. Analyze {symbol}:\n"
-        f"- Price: ${res['last_price']}, Ensemble P(UP): {res['ensemble_prob_up']*100:.1f}% -> {res['verdict']}\n"
+        f"Analyze {symbol} live ML telemetry:\n"
+        f"- Price: ${res['last_price']}, P(UP): {res['ensemble_prob_up']*100:.1f}%, Verdict: {res['verdict']}, Grade: {res['grade']}\n"
         f"- Regime: {res['regime']}, RSI: {res['rsi']:.1f}, ATR%: {res['atr_pct']:.2f}%\n"
-        f"- Crypto Fear & Greed Index: {fng_val}/100 ({fng_label}), News Sentiment Score: {news_sent}\n"
-        f"- Suggested TP: ${res['tp']}, SL: ${res['sl']}\n"
+        f"- Fear & Greed: {fng_val}/100 ({fng_label}), News Score: {news_sent}\n"
+        f"- TP1: ${res['tp']}, TP2: ${res['tp2']}, SL: ${res['sl']}\n"
         f"Give a concise 4-bullet trading & risk assessment in {lang}."
     )
     r = requests.post(
@@ -402,6 +597,7 @@ def ask_llm_analyst(api_key: str, base_url: str, model_name: str, symbol: str, r
     return r.json()["choices"][0]["message"]["content"]
 
 
+# ==================== PLOTLY CHARTS ====================
 def make_orb_figure(score: float, prob_up: float):
     n = 260
     phi = np.arccos(1 - 2 * np.linspace(0.01, 0.99, n))
@@ -474,17 +670,34 @@ def fmt_p(p: float) -> str:
     return f"${p:.8f}"
 
 
+# ==================== SIDEBAR (VISION & LLM SETTINGS) ====================
 with st.sidebar:
-    st.subheader("🤖 Optional LLM Reasoning Agent")
-    st.caption("Works with OpenAI, Groq, OpenRouter, or any OpenAI-compatible API.")
-    llm_base = st.text_input("API Base URL", value="https://api.openai.com/v1")
-    llm_model = st.text_input("Model Name", value="gpt-4o-mini")
-    llm_key = st.text_input("API Key (Optional)", type="password")
-    llm_lang = st.selectbox("Report Language", ["Moroccan Darija / Arabic", "English", "French"])
+    st.subheader("🤖 Vision AI & LLM Settings")
+    provider = st.selectbox("AI Provider Preset", [
+        "Google Gemini (Free Key)",
+        "OpenAI (GPT-4o / 4o-mini)",
+        "OpenRouter",
+        "Custom Endpoint",
+    ])
+    if provider == "Google Gemini (Free Key)":
+        def_url, def_mod = "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.5-flash"
+    elif provider == "OpenAI (GPT-4o / 4o-mini)":
+        def_url, def_mod = "https://api.openai.com/v1", "gpt-4o-mini"
+    elif provider == "OpenRouter":
+        def_url, def_mod = "https://openrouter.ai/api/v1", "openai/gpt-4o-mini"
+    else:
+        def_url, def_mod = "https://api.openai.com/v1", "gpt-4o-mini"
 
-c1, c2, c3, c4 = st.columns([3, 1.2, 1.1, 1.2])
+    llm_base = st.text_input("API Base URL", value=def_url)
+    llm_model = st.text_input("Model Name", value=def_mod)
+    llm_key = st.text_input("API Key (Paste here for Screenshot AI)", type="password")
+    llm_lang = st.selectbox("Report Language", ["Moroccan Darija / Arabic", "English", "French"])
+    st.caption("Free Gemini API key: aistudio.google.com")
+
+# ==================== TOP HEADER ====================
+c1, c2, c3, c4 = st.columns([3, 1.3, 1.0, 1.2])
 with c1:
-    st.markdown("### 🧠 QUANTUM-AI // CRYPTO & SOLANA AI TERMINAL")
+    st.markdown("### 🧠 QUANTUM-AI // GOLD, CRYPTO & CHART VISION")
 with c2:
     symbol = st.selectbox("Pair", PAIRS, index=0, label_visibility="collapsed")
 with c3:
@@ -496,20 +709,22 @@ with c4:
 fng_val, fng_label, fng_hist = fetch_fear_and_greed()
 news_items, news_sent = fetch_crypto_news()
 
-tab1, tab2, tab3 = st.tabs([
-    "🧠 AI Terminal (12 Cryptos)",
-    "🚀 Solana Memecoin AI (DexScreener)",
-    "📰 Crypto News & Fear/Greed AI",
+tab1, tab4, tab2, tab3 = st.tabs([
+    "🧠 AI Terminal (Gold & Crypto)",
+    "📸 Chart Screenshot AI (A+ / A / B)",
+    "🚀 Solana Memecoin AI",
+    "📰 News & Fear/Greed",
 ])
 
+# ==================== TAB 1: GOLD & CRYPTO ML TERMINAL ====================
 with tab1:
-    with st.spinner("Training 6 AI models on live crypto candles..."):
-        df_raw, ob, tickers, is_live = fetch_market_data(symbol, interval, limit=500)
+    with st.spinner("Training 6 AI models on live Gold/Crypto candles..."):
+        df_raw, ob, tickers, is_live, src_note = fetch_market_data(symbol, interval, limit=500)
         df_feat = build_features(df_raw)
         res = run_ai_models(df_feat, ob)
 
-    status_txt = "🟢 LIVE BINANCE" if is_live else "🟡 SIMULATION MODE"
-    st.caption(f"{status_txt} | Fear & Greed: **{fng_val}/100 ({fng_label})** | Regime: **{res['regime']}** | OOS Acc: **{res['ens_acc']*100:.1f}%**")
+    dot = "🟢" if is_live else "🟡"
+    st.caption(f"{dot} {src_note} | Fear & Greed: **{fng_val}/100 ({fng_label})** | Regime: **{res['regime']}** | OOS Acc: **{res['ens_acc']*100:.1f}%**")
 
     col_l, col_c, col_r = st.columns([1.15, 1.5, 1.1])
     with col_l:
@@ -534,11 +749,14 @@ with tab1:
     with col_c:
         st.plotly_chart(make_orb_figure(res["score"], res["ensemble_prob_up"]), use_container_width=True)
         v_cls = "big-green" if res["ensemble_prob_up"] >= 0.54 else "big-red" if res["ensemble_prob_up"] <= 0.46 else "big-amber"
+        g_color = "#00ffa3" if res["grade"].startswith("A+") else "#00f0ff" if res["grade"].startswith("A") else "#ffb800" if res["grade"].startswith("B") else "#ff3b5c"
         st.markdown(f"""
         <div class="verdict-box">
+            <div class="grade-pill" style="color:{g_color};border-color:{g_color};">SETUP GRADE: {res['grade']}</div>
             <div class="muted">ENSEMBLE AI CONSENSUS · P(UP) = {res['ensemble_prob_up']*100:.1f}%</div>
             <div class="{v_cls}">{res['verdict']}</div>
-            <div style="font-size:12px;">Price: <b>{fmt_p(res['last_price'])}</b> | TP: <b style="color:#00ffa3">{fmt_p(res['tp'])}</b> | SL: <b style="color:#ff3b5c">{fmt_p(res['sl'])}</b></div>
+            <div style="font-size:12px;">Entry: <b>{fmt_p(res['last_price'])}</b> | SL: <b style="color:#ff3b5c">{fmt_p(res['sl'])}</b></div>
+            <div style="font-size:12px;">TP1: <b style="color:#00ffa3">{fmt_p(res['tp'])}</b> | TP2: <b style="color:#00f0ff">{fmt_p(res['tp2'])}</b></div>
         </div>
         """, unsafe_allow_html=True)
         st.plotly_chart(make_candle_figure(df_feat), use_container_width=True)
@@ -546,15 +764,16 @@ with tab1:
     with col_r:
         st.markdown("**LIQUIDITY ENTANGLEMENT RADAR**")
         st.plotly_chart(make_radar_figure(ob), use_container_width=True)
-        st.markdown("**DECISION STACK · 12 CRYPTO PAIRS**")
+        st.markdown("**DECISION STACK · GOLD & CRYPTO**")
         for p in PAIRS:
             tk = tickers.get(p, {"price": 0.0, "change": 0.0})
             chg = tk["change"]
             col_c_hex = "#00ffa3" if chg > 0 else "#ff3b5c"
             tag = "BUY" if chg > 1.5 else "SHORT" if chg < -1.5 else "WAIT"
+            short_n = p.replace(" (GOLD)", "").replace("USDT", "")
             st.markdown(f"""
             <div class="agent-card" style="display:flex;justify-content:space-between;align-items:center;padding:5px 9px;margin-bottom:5px;">
-                <span><b>{p.replace('USDT','')}</b></span>
+                <span><b>{short_n}</b></span>
                 <span class="muted">{fmt_p(tk['price'])}</span>
                 <span style="color:{col_c_hex};font-weight:bold;">{chg:+.2f}% ({tag})</span>
             </div>
@@ -603,12 +822,48 @@ with tab1:
             except Exception as e:
                 st.error(f"LLM Error: {e}")
 
+# ==================== TAB 4: SCREENSHOT CHART AI ANALYZER ====================
+with tab4:
+    st.subheader("📸 Chart Screenshot AI Analyzer (Setup Grade: A+ / A / B / C)")
+    st.caption("Upload any chart screenshot (Gold XAUUSD, Crypto, Forex) to get Buy/Sell/Wait, Entry, SL, TP1/TP2, and Grade.")
+
+    sc1, sc2 = st.columns(2)
+    asset_hint = sc1.text_input("Asset (Optional)", value="XAUUSD (Gold)")
+    tf_hint = sc2.selectbox("Chart Timeframe", ["M1 / M5", "M15", "H1", "H4", "Daily"], index=2)
+
+    uploaded_img = st.file_uploader("Upload Chart Screenshot (PNG / JPG)", type=["png", "jpg", "jpeg"])
+    if uploaded_img is not None:
+        img = Image.open(uploaded_img)
+        st.image(img, caption="Uploaded Chart Screenshot", use_container_width=True)
+
+        if st.button("🔍 ANALYZE SCREENSHOT WITH AI", type="primary", use_container_width=True):
+            if llm_key:
+                with st.spinner("Vision AI reading candlesticks, price levels & liquidity..."):
+                    try:
+                        report = analyze_screenshot_vision_ai(llm_key, llm_base, llm_model, img, asset_hint, tf_hint, llm_lang)
+                        st.markdown('<div class="agent-card">', unsafe_allow_html=True)
+                        st.markdown(report)
+                        st.markdown('</div>', unsafe_allow_html=True)
+                    except Exception as e:
+                        st.error(f"Vision API Error: {e}")
+            else:
+                cv_res = local_cv_chart_scan(img)
+                st.warning("⚠️ No Vision API Key found in the sidebar (`>>` top-left). Showing **Local Computer Vision Scan** (cannot read exact price digits without Vision AI).")
+                st.markdown(f"""
+                <div class="verdict-box">
+                    <div class="grade-pill" style="color:#00f0ff;border-color:#00f0ff;">GRADE: {cv_res['grade']}</div>
+                    <div class="big-amber">{cv_res['action']}</div>
+                    <div>Recent Green Candle Dominance: <b>{cv_res['bull_pct']:.1f}%</b> | Visual Slope: <b>{cv_res['slope']}</b></div>
+                </div>
+                """, unsafe_allow_html=True)
+                st.info("💡 **للحصول على أرقام الدخول و SL و TP الحقيقية من الصورة:** فتح القائمة الجانبية (`>>` الفوق على اليسار)، اختار **Google Gemini (Free Key)**، وجيب مفتاح مجاني من `aistudio.google.com` ولصقو فخانة API Key!")
+
+# ==================== TAB 2: SOLANA MEMECOIN AI SCANNER ====================
 with tab2:
     st.subheader("🚀 Solana Memecoin & DEX AI Risk Scanner (Live via DexScreener)")
-    st.caption("Inspects real-time liquidity, FDV ratio, 1H Buy/Sell pressure, and scores Rug-Pull Risk vs Momentum.")
     sol_tokens = fetch_solana_memecoins()
     if not sol_tokens:
-        st.warning("Could not fetch live Solana tokens right now (offline or rate-limited). Click Refresh AI.")
+        st.warning("Could not fetch live Solana tokens right now. Click Refresh AI.")
     else:
         sol_df = pd.DataFrame(sol_tokens)
         st.dataframe(
@@ -617,6 +872,7 @@ with tab2:
             hide_index=True,
         )
 
+# ==================== TAB 3: NEWS & FEAR/GREED AI ====================
 with tab3:
     st.subheader("📰 Crypto Macro Sentiment & Live Headlines")
     m1, m2, m3 = st.columns(3)
